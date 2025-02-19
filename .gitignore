@@ -1,6 +1,9 @@
 # Prerequisites
 *.d
 
+# Input files (Program is using text files)
+*.txt
+
 # Compiled Object files
 *.slo
 *.lo
@@ -30,3 +33,7 @@
 *.exe
 *.out
 *.app
+
+# Misc. files and folders
+*.png
+*.vscode
