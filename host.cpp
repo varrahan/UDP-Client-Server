@@ -1,124 +1,117 @@
 #include "datagram.h"
 
 /**
- * @class Host
- * A UDP-based host that forwards packets between a client and a server.
- * The Host listens on a predefined port for incoming client messages, forwards them to a predefined server address, receives the server's response, and relays it back to the client.
+ * A UDP-based intermediate host for RPC communication between client and server
  */
 class Host : private Socket {
 private:
-    struct sockaddr_in serverAddr; // Server address information.
+    struct sockaddr_in serverAddr;      // Server address
+    std::mutex mtx;                     // Mutex
+    std::condition_variable cv;         // Condition variable
+    std::queue<std::vector<uint8_t>> clientToServerQueue;  // Queue for client to server 
+    std::queue<std::vector<uint8_t>> serverToClientQueue;  // Queue for server to client
+    std::atomic<bool> running;          // Flag for thread execution
+    std::thread clientToServerThread; // Thread from client to server
+    std::thread serverToClientThread; // Thread from server to client
     
     /**
-     * Forwards a packet to the server and relays the response back to the client.
-     * @param packet The packet received from the client.
-     * @param clientAddr The address of the client.
-     * @param clientLen The length of the client's address structure.
+     * Thread function to handle client requests and forward them to the server.
      */
-    void forward(const std::vector<uint8_t>& packet, const struct sockaddr_in& clientAddr, socklen_t clientLen) {
-        // Forward to server
-        if (sendto(sockfd, packet.data(), packet.size(), 0,
-                   (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            perror("Forward to server failed");
-            return;
-        }
-        
-        // Receive response from server
-        char buffer[1024];
-        struct sockaddr_in responseAddr;
-        socklen_t responseLen = sizeof(responseAddr);
-        
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sockfd, &readfds);
-
-        struct timeval timeout;
-        timeout.tv_sec = 5;  // Set 5 second timeout
-        timeout.tv_usec = 0;
-
-        int activity = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
-
-        if (activity == 0) {  // Timeout occurred
-            std::cerr << "Timeout: No response received within 5 seconds" << std::endl;
-            exit(1);
-        } else if (activity < 0) {
-            throw std::runtime_error("Error during select()");
-        }
-
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
-                         (struct sockaddr*)&responseAddr, &responseLen);
-        if (n < 0) {
-            perror("Receive from server failed");
-            return;
-        }
-        
-        std::vector<uint8_t> response(buffer, buffer + n);
-        std::cout << "Received from server:" << std::endl;
-        Datagram::printPacket(response);
-        
-        // Forward response to client
-        if (sendto(sockfd, response.data(), response.size(), 0,
-                   (struct sockaddr*)&clientAddr, clientLen) < 0) {
-            perror("Forward to client failed");
-        }
-    }
-public:
-    /**
-     * Initializes the server address structure and binds the socket to port 50023 for communication.
-     * Constructs a Host object and binds it to a port.
-     */
-    Host() {
-        bind(50023);  // Non-privileged port
-        
-        memset(&serverAddr, 0, sizeof(serverAddr));
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(50069);
-        serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        
-        std::cout << "Host initialized" << std::endl;
-    }
-
-    /**
-     * Enters a loop where it receives packets from clients, prints the packet data, and forwards it to the server.
-     * Starts the host to listen and forward packets.
-     */
-    void run() {
-        std::cout << "Host running" << std::endl;
-        
-        while (true) {
+    void clientToServerWorker() {
+        while (running) {
             char buffer[1024];
             struct sockaddr_in clientAddr;
             socklen_t clientLen = sizeof(clientAddr);
-
+            
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(sockfd, &readfds);
+            
+            // Initialize timeout for socket
+            struct timeval timeout;
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            
+            int activity = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+            
+            if (activity == 0) continue;
+            if (activity < 0) {
+                if (errno == EINTR) continue;
+                perror("Select error in client-server thread");
+                break;
+            }
+            // Receive client message
             int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                             (struct sockaddr*)&clientAddr, &clientLen);
             if (n < 0) {
                 perror("Receive from client failed");
                 continue;
             }
-            std::vector<uint8_t> packet(buffer, buffer + n);
+            std::vector<uint8_t> clientPacket(buffer, buffer + n);
             std::cout << "\nReceived from client:" << std::endl;
-            Datagram::printPacket(packet);
-            
-            forward(packet, clientAddr, clientLen);
+            Datagram::printPacket(clientPacket);
+            std::vector<uint8_t> serverResponse;
+            // Check if successful communication with server
+            bool success = rpcSend(clientPacket, serverAddr, sizeof(serverAddr), serverResponse);
+            if (!success) {
+                std::cout << "Failed to communicate with server, sending error to client" << std::endl;
+                serverResponse = {0, static_cast<uint8_t>(Datagram::Type::ERROR), 0, 1, 'S', 'e', 'r', 'v', 'e', 'r', ' ', 'e', 'r', 'r', 'o', 'r', 0};
+            } else {
+                std::cout << "Received from server:" << std::endl;
+                Datagram::printPacket(serverResponse);
+            }
+            // Check if successful communication with client
+            if (sendto(sockfd, serverResponse.data(), serverResponse.size(), 0,
+                      (struct sockaddr*)&clientAddr, clientLen) < 0) {
+                perror("Forward to client failed");
+            } else {
+                std::cout << "Forwarded server response to client" << std::endl;
+            }
         }
     }
+    
+public:
+    /**
+     * Initializes the host for RPC communication.
+     */
+    Host() : running(true) {
+        bind(50023);
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(50069);
+        serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        std::cout << "Host initialized on port 50023, server on port 50069" << std::endl;
+        clientToServerThread = std::thread(&Host::clientToServerWorker, this);
+    }
+    
+    /**
+     * Destructor for Host
+     */
+    ~Host() {
+        running = false;
+        if (clientToServerThread.joinable()) {
+            clientToServerThread.join();
+        }
+        std::cout << "Host shut down" << std::endl;
+    }
 
+    /**
+     * Run method to run threads
+     */
+    void run() {
+        std::cout << "Host running" << std::endl;
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
 };
 
 /**
- * Main function to start the host. 
- * Creates a Host instance and runs it. 
- * Handles any exceptions that may occur.
- * @return int Exit status code.
+ * Main function to run the intermediate host
+ * @return Exit
  */
 int main() {
-    try {
-        Host host;
-        host.run();
-    } catch (const std::exception& e) {
-        std::cerr << "Host error: " << e.what() << std::endl;
-        return 1;
-    }
+    Host host;
+    host.run();
     return 0;
 }

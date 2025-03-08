@@ -1,98 +1,93 @@
 #include "datagram.h"
 
 /**
- * @class Server
- * A simple UDP server that listens on port 50069 and processes requests. 
- * The server binds to a predefined port and continuously listens for incoming datagrams. 
- * It processes read and write requests by validating incoming packets and responding accordingly.
+ * UDP server that processes requests in RPC style.
  */
 class Server : private Socket {
 private:
-    bool invalid_flag = false; // For this assignment, since the last request is invalid, force a termination after reading an invalid packet
-
+    bool invalid_flag = false; // Flag to terminate after processing an invalid packet
+    
     /**
-     * Processes incoming UDP requests.
-     * This method receives datagrams, validates them, and responds accordingly.
-     * It supports two types of requests: read (response code {0, 3, 0, 1}) and write (response code {0, 4, 0, 0}).
+     * Processes an incoming RPC request and prepares the response
+     * @param request The incoming request packet
+     * @return The response packet to send back
      */
-   void processRequest() {
-        char buffer[1024];
-        struct sockaddr_in clientAddr;
-        socklen_t clientLen = sizeof(clientAddr);
-        
-        // Receive data from the client through the host
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
-                        (struct sockaddr*)&clientAddr, &clientLen);
-        if(n < 0) {
-            perror("Receive failed");
-            return;
-        }
-        
-        // Convert received data to a packet vector
-        std::vector<uint8_t> packet(buffer, buffer + n);
-        std::cout << "\nReceived request:" << std::endl;
-        Datagram::printPacket(packet);
-        
-        // Validate the received packet
-        if(!Datagram::isValidRequest(packet)) {
+    std::vector<uint8_t> processRequest(const std::vector<uint8_t>& request) {
+        std::cout << "\nProcessing request:" << std::endl;
+        Datagram::printPacket(request);
+        // Check if request is valid
+        if(!Datagram::isValidRequest(request)) {
             std::cerr << "Invalid packet format" << std::endl;
             invalid_flag = true;
-            return;
+            return {0, static_cast<uint8_t>(Datagram::Type::ERROR), 0, 0, 'I', 'n', 'v', 'a', 'l', 'i', 'd', ' ', 'r', 'e', 'q', 'u', 'e', 's', 't', 0};
         }
-        
-        // Prepare response based on request type
+        // Response if read request
         std::vector<uint8_t> response;
-        if(packet[1] == 1) {  // Read request
-            response = {0, 3, 0, 1};
-        } else {  // Write request
-            response = {0, 4, 0, 0};
+        if(request[1] == static_cast<uint8_t>(Datagram::Type::READ)) {
+            response = Datagram::createData(1, {'D', 'a', 't', 'a', ' ', 'f', 'o', 'r', ' ', 'r', 'e', 'a', 'd', ' ', 'r', 'e', 'q', 'u', 'e', 's', 't'});
+        } else {
+            // Ack response
+            response = Datagram::createAck(0);
         }
-        
         std::cout << "Sending response:" << std::endl;
         Datagram::printPacket(response);
-        
-        // Send response back to the client
-        if(sendto(sockfd, response.data(), response.size(), 0,
-                 (struct sockaddr*)&clientAddr, clientLen) < 0) {
-            perror("Send failed");
-        }
+        return response;
     }
+    
 public:
     /**
-     * Constructs a Server instance and binds it to port 50069. 
-     * Initializes the server and binds it to a non-privileged port for communication.
+     * Creates Server instance and binds it to port 50069.
      */
     Server() {
-        bind(50069);  // Non-privileged port
+        bind(50069);
         std::cout << "Server initialized on port 50069" << std::endl;
     }
-
+    
     /**
-     * Runs the server in an infinite loop to process incoming requests. This method continuously listens for and processes client requests.
+     * Runs the server to process incoming RPC requests.
+     * Processes requests until an invalid packet is received.
      */
     void run() {
         std::cout << "Server running" << std::endl;
-        while(true) {
-            if (invalid_flag) {
-                return;
+        
+        while(!invalid_flag) {
+            char buffer[1024];
+            struct sockaddr_in clientAddr;
+            socklen_t clientLen = sizeof(clientAddr);
+            
+            // Wait for reqeust
+            int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                            (struct sockaddr*)&clientAddr, &clientLen);
+            if(n < 0) {
+                perror("Receive failed");
+                continue;
             }
-            processRequest();
+
+            // Process request and create response
+            std::vector<uint8_t> request(buffer, buffer + n);
+            std::vector<uint8_t> response = processRequest(request);
+            
+            // If issue with sending packet, print error message
+            if(sendto(sockfd, response.data(), response.size(), 0,
+                     (struct sockaddr*)&clientAddr, clientLen) < 0) {
+                perror("Send failed");
+            }
+            
+            // If packet is invalid, exit run
+            if (Datagram::getPacketType(request) == Datagram::Type::INVALID) {
+                std::cout << "Processed invalid packet, terminating server" << std::endl;
+                break;
+            }
         }
     }
 };
 
 /**
- * The entry point of the program. Initializes and runs the server.
- * If an exception occurs, it prints an error message.
- * @return int Returns 0 on success, 1 on error.
+ * Main function to start the server
+ * @return Exit
  */
 int main() {
-    try {
-        Server server;
-        server.run();
-    } catch(const std::exception& e) {
-        std::cerr << "Server error: " << e.what() << std::endl;
-        return 1;
-    }
+    Server server;
+    server.run();
     return 0;
 }
